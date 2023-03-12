@@ -31,12 +31,14 @@ get_systrace()
 	echo 1 > $TRACING_PATH/events/irq/enable
 	echo 1 > $TRACING_PATH/events/ipi/enable
 
-	# idle
+	# cpu idle and frequency
 	echo 1 > $TRACING_PATH/events/power/cpu_idle/enable
+	echo 1 > $TRACING_PATH/events/power/cpu_frequency/enable
+	echo 1 > $TRACING_PATH/events/power/cpu_frequency_limits/enable
 
 	echo 1 > $TRACING_PATH/tracing_on
 
-	sleep $sleepTime
+	eval $CMDLINE
 
 	echo 0 > $TRACING_PATH/tracing_on
 	echo 0 > $TRACING_PATH/events/enable
@@ -45,10 +47,31 @@ get_systrace()
 	echo > $TRACING_PATH/trace
 }
 
+get_cmd()
+{
+	# -t time
+	# -r cmdline
+	while getopts "t:r:" OPT
+	do
+		case $OPT in
+			t)
+				CMDLINE="sleep $OPTARG"
+				;;
+			r)
+				shift $((OPTIND-2))
+				CMDLINE=$* #$OPTARG
+				;;
+			?)
+				echo "unkonw argument"
+				#exit 1
+				;;
+		esac
+	done
+}
 
 trap "trace_clean" 1 2 3 9 15
 
 trace_clean
-get_systrace $1
+get_cmd $*
+get_systrace
 trace_clean
-
