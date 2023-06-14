@@ -66,6 +66,9 @@ Drag trace.html into the chrome window
 ## 2.2 fix_time
 -------
 
+### 2.2.1 fix_time.pl
+-------
+
 We can see that the time shown in the Trace-Viewer(systrace)
 is relative-time,
 
@@ -85,6 +88,18 @@ perl scripts/fix_time.pl ./trace.html  trace.html.js
 The relative time is shown in the output file `trace.html.js`
 
 ![fix_time](./doc/fix_time.png)
+
+
+### 2.2.2 SystraceAnalysis.py
+-------
+
+[[Python解析systrace.html]chrome打开systrace分析，图形显示时间点与文本时间点一一对应，方便debug使用](https://blog.csdn.net/wukongmingjing/article/details/95049107)
+
+[GitHub: samarxie/systrace/SystraceAnalysis.py](https://github.com/samarxie/systrace/blob/master/SystraceAnalysis.py)
+
+```cpp
+python SystraceAnalysis.py -i systrace.html -o trace.txt -d delta_value
+```
 
 
 # 3 Reference
