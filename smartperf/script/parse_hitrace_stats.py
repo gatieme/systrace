@@ -958,7 +958,7 @@ def main(argv: list[str]) -> int:
         print("trace_range 表无数据，无法获取时间范围")
         return 1
     trace_start_ts, trace_end_ts = int(row[0]), int(row[1])
-    print(f"trace_range: start_ts={trace_start_ts}, end_ts={trace_end_ts}")
+    print(f"trace_real_range:  [{trace_start_ts}, {trace_end_ts}]")
 
     # 校验用户指定的 start_ns / end_ns
     start_ns = args.start_ns
@@ -972,20 +972,23 @@ def main(argv: list[str]) -> int:
     if start_ns is not None and end_ns is not None and start_ns >= end_ns:
         print(f"start_ns ({start_ns}) >= end_ns ({end_ns})，区间无效")
         return 1
+    print(f"select_real_range: [{start_ns}, {end_ns}]")
 
     # 将 start_ns/end_ns 转换为 wall clock 时间戳（与 intervals/samples 的 wall_ts_ns 对齐）
     wall_base_ns = filename_wall_base_ns(db_path)
     range_start_wall_ns = wall_base_ns + (start_ns - trace_start_ts) if start_ns is not None else None
     range_end_wall_ns = wall_base_ns + (end_ns - trace_start_ts) if end_ns is not None else None
-    if range_start_wall_ns is not None:
-        print(f"分析区间 wall_start: {range_start_wall_ns}")
-    if range_end_wall_ns is not None:
-        print(f"分析区间 wall_end: {range_end_wall_ns}")
+    #if range_start_wall_ns is not None:
+    #    print(f"分析区间 wall_start: {range_start_wall_ns}")
+    #if range_end_wall_ns is not None:
+    #    print(f"分析区间 wall_end: {range_end_wall_ns}")
+    print(f"select_wall_range: [{range_start_wall_ns}, {range_end_wall_ns}]")
 
     # 输出路径
     output_path = args.output.resolve() if args.output else db_path.with_suffix(".stats.xlsx")
 
-    print(f"Reading {db_path} ...")
+    print(f"Reading {db_path}")
+    print(f".......")
     db_files = [db_path]
     intervals, cpu_meta = merge_db_intervals(db_files)
     gpu_samples, gpu_meta = merge_gpu_samples(db_files)
@@ -1000,7 +1003,7 @@ def main(argv: list[str]) -> int:
         source_label=source_label, interval_sec=interval_sec, gpu_df=gpu_df,
     )
 
-    print(f"Done.")
+    print(f"Done...")
     print(f"Output: {output_path}")
     print(f"  interval: {il}")
     print(f"  running slices: {len(intervals)}")
