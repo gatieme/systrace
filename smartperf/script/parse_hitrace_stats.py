@@ -78,6 +78,29 @@ def filename_wall_base_ns(path: Path) -> int:
     return int(dt.timestamp() * 1_000_000_000)
 
 
+def resolve_wall_base_ns(db_path: Path, conn: sqlite3.Connection | None = None) -> int:
+    """优先从 clock_snapshot 表获取 realtime 墙钟基准时间(ns)，失败则回退到文件名提取。
+
+    clock_snapshot 中 clock_name='realtime' 的 ts 即为墙钟纳秒时间戳，
+    直接用作 wall_base_ns，比从文件名中推算更准确。
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT ts FROM clock_snapshot WHERE clock_name = 'realtime'"
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+    except sqlite3.OperationalError:
+        pass  # clock_snapshot 表不存在，回退到文件名
+    finally:
+        if own_conn:
+            conn.close()
+    return filename_wall_base_ns(db_path)
+
+
 def load_running_intervals(db_path: Path) -> tuple[int, int, list[dict]]:
     conn = sqlite3.connect(db_path)
     try:
@@ -85,7 +108,7 @@ def load_running_intervals(db_path: Path) -> tuple[int, int, list[dict]]:
         if not row:
             return 0, 0, []
         trace_start_ts, trace_end_ts = int(row[0]), int(row[1])
-        wall_base_ns = filename_wall_base_ns(db_path)
+        wall_base_ns = resolve_wall_base_ns(db_path, conn)
         query = """
             SELECT ts, dur, cpu
             FROM thread_state
@@ -128,7 +151,7 @@ def merge_db_intervals(db_files: list[Path]) -> tuple[list[dict], dict]:
                 "running_slices": len(intervals),
                 "wall_base_local": str(
                     datetime.fromtimestamp(
-                        filename_wall_base_ns(db_path) / 1e9, tz=LOCAL_TZ
+                        resolve_wall_base_ns(db_path) / 1e9, tz=LOCAL_TZ
                     )
                 ),
             }
@@ -145,7 +168,7 @@ def load_gpu_measure_samples(db_path: Path) -> tuple[int, int, list[dict]]:
         if not row:
             return 0, 0, []
         trace_start_ts, trace_end_ts = int(row[0]), int(row[1])
-        wall_base_ns = filename_wall_base_ns(db_path)
+        wall_base_ns = resolve_wall_base_ns(db_path, conn)
         trace_end_wall_ns = wall_base_ns + (trace_end_ts - trace_start_ts)
 
         filter_rows = conn.execute(
@@ -209,7 +232,7 @@ def merge_gpu_samples(db_files: list[Path]) -> tuple[list[dict], dict]:
                 "gpu_measure_samples": len(samples),
                 "wall_base_local": str(
                     datetime.fromtimestamp(
-                        filename_wall_base_ns(db_path) / 1e9, tz=LOCAL_TZ
+                        resolve_wall_base_ns(db_path) / 1e9, tz=LOCAL_TZ
                     )
                 ),
             }
@@ -950,15 +973,17 @@ def main(argv: list[str]) -> int:
 
     interval_sec = args.interval / 1000.0  # ms → s
 
-    # 获取 trace_range 用于校验和坐标转换
+    # 获取 trace_range 用于校验和坐标转换，同时获取 wall_base_ns
     conn = sqlite3.connect(db_path)
     row = conn.execute("SELECT start_ts, end_ts FROM trace_range").fetchone()
-    conn.close()
     if not row:
+        conn.close()
         print("trace_range 表无数据，无法获取时间范围")
         return 1
     trace_start_ts, trace_end_ts = int(row[0]), int(row[1])
     print(f"trace_real_range:  [{trace_start_ts}, {trace_end_ts}]")
+    wall_base_ns = resolve_wall_base_ns(db_path, conn)
+    conn.close()
 
     # 校验用户指定的 start_ns / end_ns
     start_ns = args.start_ns
@@ -975,7 +1000,6 @@ def main(argv: list[str]) -> int:
     print(f"select_real_range: [{start_ns}, {end_ns}]")
 
     # 将 start_ns/end_ns 转换为 wall clock 时间戳（与 intervals/samples 的 wall_ts_ns 对齐）
-    wall_base_ns = filename_wall_base_ns(db_path)
     range_start_wall_ns = wall_base_ns + (start_ns - trace_start_ts) if start_ns is not None else None
     range_end_wall_ns = wall_base_ns + (end_ns - trace_start_ts) if end_ns is not None else None
     #if range_start_wall_ns is not None:
