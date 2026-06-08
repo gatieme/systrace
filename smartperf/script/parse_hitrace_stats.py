@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Read HiSmartPerf .db traces, merge by filename timestamp, export 5s CPU/GPU stats to xlsx."""
+"""Read HiSmartPerf .db traces, compute CPU/GPU usage at configurable intervals, export to xlsx."""
 
 from __future__ import annotations
 
+import argparse
+import bisect
 import re
 import sqlite3
 import sys
@@ -21,7 +23,14 @@ from openpyxl.drawing.line import LineProperties
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 TRACE_TS_RE = re.compile(r"record_trace_(\d{14})@|trace_(\d{14})@")
 EXPECTED_CPUS = list(range(16))
-CPU_GROUP_INTERVAL_SEC = 5
+def format_interval_label(interval_sec: float) -> str:
+    """将 interval_sec 转为可读标签，如 '5s', '10ms', '100ms'。"""
+    if interval_sec >= 1.0 and interval_sec == int(interval_sec):
+        return f"{int(interval_sec)}s"
+    ms = interval_sec * 1000
+    if ms >= 1.0 and ms == int(ms):
+        return f"{int(ms)}ms"
+    return f"{interval_sec:.4g}s"
 LINE_COLORS = (
     "4472C4",
     "ED7D31",
@@ -222,14 +231,18 @@ def measure_time_weighted_avg(
     samples: list[dict],
     win_start_ns: int,
     win_end_ns: int,
+    idx_start: int = 0,
+    idx_end: int | None = None,
 ) -> float:
     """Time-weighted average of piecewise-constant measure samples in a window."""
     window_ns = win_end_ns - win_start_ns
     if window_ns <= 0:
         return 0.0
 
+    end_idx = idx_end if idx_end is not None else len(samples)
     weighted_sum = 0.0
-    for sample in samples:
+    for i in range(idx_start, end_idx):
+        sample = samples[i]
         start = sample["wall_ts_ns"]
         end = _sample_end_ns(sample)
         if end <= win_start_ns or start >= win_end_ns:
@@ -242,22 +255,31 @@ def measure_time_weighted_avg(
 
 
 def gpu_metrics_for_window(
-    samples: list[dict],
+    load_samples: list[dict],
+    load_starts: list[int],
+    freq_by_filter: dict[int, list[dict]],
+    freq_starts_by_filter: dict[int, list[int]],
     win_start_ns: int,
     win_end_ns: int,
+    load_left_idx: int,
+    freq_left_indices: dict[int, int],
 ) -> dict[str, float]:
-    load_samples = [s for s in samples if s["metric"] == "gpuload"]
-    freq_samples = [s for s in samples if s["metric"] == "gpufreq"]
+    load_right_idx = bisect.bisect_left(load_starts, win_end_ns)
+    gpuload = measure_time_weighted_avg(
+        load_samples, win_start_ns, win_end_ns,
+        idx_start=load_left_idx, idx_end=load_right_idx,
+    )
 
-    gpuload = measure_time_weighted_avg(load_samples, win_start_ns, win_end_ns)
-
-    freq_by_filter: dict[int, list[dict]] = defaultdict(list)
-    for sample in freq_samples:
-        freq_by_filter[sample["filter_id"]].append(sample)
-    freq_avgs = [
-        measure_time_weighted_avg(filter_samples, win_start_ns, win_end_ns)
-        for filter_samples in freq_by_filter.values()
-    ]
+    freq_avgs = []
+    for filter_id, filter_samples in freq_by_filter.items():
+        freq_starts = freq_starts_by_filter[filter_id]
+        freq_right_idx = bisect.bisect_left(freq_starts, win_end_ns)
+        fi = freq_left_indices.get(filter_id, 0)
+        avg = measure_time_weighted_avg(
+            filter_samples, win_start_ns, win_end_ns,
+            idx_start=fi, idx_end=freq_right_idx,
+        )
+        freq_avgs.append(avg)
     gpufreq_hz = max(freq_avgs) if freq_avgs else 0.0
 
     return {
@@ -266,23 +288,69 @@ def gpu_metrics_for_window(
     }
 
 
-def compute_gpu_measure_5s(samples: list[dict]) -> pd.DataFrame:
+def compute_gpu_measure(
+    samples: list[dict],
+    interval_sec: float,
+    range_start_wall_ns: int | None = None,
+    range_end_wall_ns: int | None = None,
+) -> pd.DataFrame:
     if not samples:
         return pd.DataFrame()
 
     timeline_start = min(sample["wall_ts_ns"] for sample in samples)
     timeline_end = max(_sample_end_ns(sample) for sample in samples)
-    window_ns = CPU_GROUP_INTERVAL_SEC * 1_000_000_000
+
+    win_start_bound = range_start_wall_ns if range_start_wall_ns is not None else timeline_start
+    win_end_bound = range_end_wall_ns if range_end_wall_ns is not None else timeline_end
+
+    win_start_bound = max(win_start_bound, timeline_start)
+    win_end_bound = min(win_end_bound, timeline_end)
+
+    if win_start_bound >= win_end_bound:
+        return pd.DataFrame()
+
+    window_ns = int(interval_sec * 1_000_000_000)
+
+    # 预拆分 GPU 样本，构建各自的排序时间戳列表
+    load_samples = [s for s in samples if s["metric"] == "gpuload"]
+    load_starts = [s["wall_ts_ns"] for s in load_samples]
+
+    freq_by_filter: dict[int, list[dict]] = defaultdict(list)
+    for sample in samples:
+        if sample["metric"] == "gpufreq":
+            freq_by_filter[sample["filter_id"]].append(sample)
+    freq_starts_by_filter: dict[int, list[int]] = {}
+    for filter_id, filter_samples in freq_by_filter.items():
+        freq_starts_by_filter[filter_id] = [s["wall_ts_ns"] for s in filter_samples]
 
     rows = []
-    win_start = timeline_start
-    while win_start < timeline_end:
-        win_end = min(win_start + window_ns, timeline_end)
-        metrics = gpu_metrics_for_window(samples, win_start, win_end)
+    win_start = win_start_bound
+    load_left_idx = 0
+    freq_left_indices: dict[int, int] = {fid: 0 for fid in freq_by_filter}
+    while win_start < win_end_bound:
+        win_end = min(win_start + window_ns, win_end_bound)
+
+        # 推进 load 滑动左边界
+        while load_left_idx < len(load_samples) and _sample_end_ns(load_samples[load_left_idx]) <= win_start:
+            load_left_idx += 1
+        # 推进各 filter 的 freq 滑动左边界
+        for filter_id, filter_samples in freq_by_filter.items():
+            fi = freq_left_indices[filter_id]
+            while fi < len(filter_samples) and _sample_end_ns(filter_samples[fi]) <= win_start:
+                fi += 1
+            freq_left_indices[filter_id] = fi
+
+        metrics = gpu_metrics_for_window(
+            load_samples, load_starts,
+            freq_by_filter, freq_starts_by_filter,
+            win_start, win_end,
+            load_left_idx, freq_left_indices,
+        )
+
         row = {
             "window_start_ns": win_start,
             "window_end_ns": win_end,
-            "elapsed_sec": len(rows) * CPU_GROUP_INTERVAL_SEC,
+            "elapsed_sec": round(len(rows) * interval_sec, 4),
             "gpuload": metrics["gpuload"],
             "gpufreq_mhz": metrics["gpufreq_mhz"],
         }
@@ -359,6 +427,8 @@ def cpu_usage_for_window(
     win_start_ns: int,
     win_end_ns: int,
     cpus: list[int] | None = None,
+    idx_start: int = 0,
+    idx_end: int | None = None,
 ) -> dict[int, float]:
     """HiSmartPerf getTabCpuUsage: sum clipped Running dur / window length."""
     target_cpus = cpus if cpus is not None else EXPECTED_CPUS
@@ -366,8 +436,10 @@ def cpu_usage_for_window(
     if window_ns <= 0:
         return {cpu_id: 0.0 for cpu_id in target_cpus}
 
+    end_idx = idx_end if idx_end is not None else len(intervals)
     busy_ns: dict[int, int] = defaultdict(int)
-    for row in intervals:
+    for i in range(idx_start, end_idx):
+        row = intervals[i]
         cpu_id = row["cpu_id"]
         if cpu_id not in target_cpus:
             continue
@@ -386,26 +458,54 @@ def cpu_usage_for_window(
     }
 
 
-def compute_cpu_usage_5s(intervals: list[dict]) -> pd.DataFrame:
+def compute_cpu_usage(
+    intervals: list[dict],
+    interval_sec: float,
+    range_start_wall_ns: int | None = None,
+    range_end_wall_ns: int | None = None,
+) -> pd.DataFrame:
     if not intervals:
         return pd.DataFrame()
 
     timeline_start = min(row["wall_ts_ns"] for row in intervals)
     timeline_end = max(row["wall_ts_ns"] + row["dur_ns"] for row in intervals)
-    window_ns = CPU_GROUP_INTERVAL_SEC * 1_000_000_000
+
+    # 用户指定区间优先，否则用数据边界
+    win_start_bound = range_start_wall_ns if range_start_wall_ns is not None else timeline_start
+    win_end_bound = range_end_wall_ns if range_end_wall_ns is not None else timeline_end
+
+    # 裁剪：确保分析区间在数据范围内
+    win_start_bound = max(win_start_bound, timeline_start)
+    win_end_bound = min(win_end_bound, timeline_end)
+
+    if win_start_bound >= win_end_bound:
+        return pd.DataFrame()
+
+    window_ns = int(interval_sec * 1_000_000_000)
+
+    # 提取排序后的 wall_ts_ns 列表，用于 bisect 加速区间查找
+    starts_sorted = [row["wall_ts_ns"] for row in intervals]
 
     rows = []
-    win_start = timeline_start
-    while win_start < timeline_end:
-        win_end = min(win_start + window_ns, timeline_end)
-        usage = cpu_usage_for_window(intervals, win_start, win_end)
+    win_start = win_start_bound
+    # 滑动窗口左边界：跳过已经结束的 intervals
+    left_idx = 0
+    while win_start < win_end_bound:
+        win_end = min(win_start + window_ns, win_end_bound)
+        # 推进 left_idx：跳过 wall_ts_ns + dur_ns <= win_start 的 intervals
+        while left_idx < len(intervals) and intervals[left_idx]["wall_ts_ns"] + intervals[left_idx]["dur_ns"] <= win_start:
+            left_idx += 1
+        # bisect 找右边界：所有 wall_ts_ns < win_end 的 intervals
+        right_idx = bisect.bisect_left(starts_sorted, win_end)
+
+        usage = cpu_usage_for_window(intervals, win_start, win_end, idx_start=left_idx, idx_end=right_idx)
         window_dt_utc = datetime.fromtimestamp(win_start / 1e9, tz=timezone.utc)
         row = {
             "window_start_ns": win_start,
             "window_end_ns": win_end,
             "datetime_utc": window_dt_utc,
             "window_time_local": window_dt_utc.astimezone(LOCAL_TZ).replace(tzinfo=None),
-            "elapsed_sec": len(rows) * CPU_GROUP_INTERVAL_SEC,
+            "elapsed_sec": round(len(rows) * interval_sec, 4),
         }
         for cpu_id in EXPECTED_CPUS:
             row[f"CPU{cpu_id}"] = usage.get(cpu_id, 0.0)
@@ -499,6 +599,7 @@ def _configure_chart_axes(
     x_max_value: float,
     y_min: float,
     y_max: float,
+    interval_sec: float,
 ) -> None:
     chart.x_axis.title = x_axis_title
     chart.y_axis.title = y_axis_title
@@ -513,13 +614,13 @@ def _configure_chart_axes(
     chart.y_axis.scaling.min = y_min
     chart.y_axis.scaling.max = y_max
     if not use_datetime:
-        x_max = max(x_max_value, CPU_GROUP_INTERVAL_SEC)
+        x_max = max(x_max_value, interval_sec)
         x_max = (
-            int(x_max + CPU_GROUP_INTERVAL_SEC - 1) // CPU_GROUP_INTERVAL_SEC
-        ) * CPU_GROUP_INTERVAL_SEC
+            int(x_max + interval_sec - 1) // interval_sec
+        ) * interval_sec if interval_sec >= 1 else round((x_max + interval_sec) / interval_sec) * interval_sec
         chart.x_axis.scaling.min = 0
         chart.x_axis.scaling.max = x_max
-        chart.x_axis.majorUnit = CPU_GROUP_INTERVAL_SEC
+        chart.x_axis.majorUnit = interval_sec
 
 
 def _add_scatter_line_chart(
@@ -533,6 +634,7 @@ def _add_scatter_line_chart(
     y_num_fmt: str = "0.0",
     y_max_cap: float | None = 100.0,
     chart_anchor: str | None = None,
+    interval_sec: float = 5.0,
 ) -> None:
     if chart_xy_df.empty:
         return
@@ -573,6 +675,7 @@ def _add_scatter_line_chart(
         x_max_value=x_max_value,
         y_min=y_min,
         y_max=y_max,
+        interval_sec=interval_sec,
     )
 
     xvalues = Reference(ws, min_col=x_col, min_row=2, max_row=n_rows)
@@ -595,34 +698,39 @@ def _add_cpu_charts(
     xlsx_path: Path,
     chart_xy_df: pd.DataFrame,
     chart_xy_group_df: pd.DataFrame,
+    interval_sec: float,
 ) -> None:
     if chart_xy_df.empty and chart_xy_group_df.empty:
         return
 
+    il = format_interval_label(interval_sec)
     wb = load_workbook(xlsx_path)
     if not chart_xy_df.empty and "chart_xy" in wb.sheetnames:
         _add_scatter_line_chart(
             wb["chart_xy"],
             chart_xy_df,
-            chart_title="CPU Usage (5s, HiSmartPerf thread_state)",
+            chart_title=f"CPU Usage ({il}, HiSmartPerf thread_state)",
             colors=LINE_COLORS,
             show_data_labels=True,
+            interval_sec=interval_sec,
         )
     if not chart_xy_group_df.empty and "chart_xy_group" in wb.sheetnames:
         _add_scatter_line_chart(
             wb["chart_xy_group"],
             chart_xy_group_df,
-            chart_title="CPU Group Avg (CPU0-3 / CPU4-9 / CPU10-15, 5s)",
+            chart_title=f"CPU Group Avg (CPU0-3 / CPU4-9 / CPU10-15, {il})",
             colors=GROUP_LINE_COLORS,
             show_data_labels=True,
+            interval_sec=interval_sec,
         )
     wb.save(xlsx_path)
 
 
-def _add_gpu_charts(xlsx_path: Path, chart_gpu_df: pd.DataFrame) -> None:
+def _add_gpu_charts(xlsx_path: Path, chart_gpu_df: pd.DataFrame, interval_sec: float) -> None:
     if chart_gpu_df.empty:
         return
 
+    il = format_interval_label(interval_sec)
     wb = load_workbook(xlsx_path)
     if "chart_gpu" not in wb.sheetnames:
         wb.save(xlsx_path)
@@ -635,33 +743,36 @@ def _add_gpu_charts(xlsx_path: Path, chart_gpu_df: pd.DataFrame) -> None:
     _add_scatter_line_chart(
         ws,
         load_df,
-        chart_title="GPU Load (5s avg, measure gpuload)",
+        chart_title=f"GPU Load ({il} avg, measure gpuload)",
         colors=(GPU_LINE_COLORS[0],),
         show_data_labels=True,
         y_axis_title="GPU Load (%)",
         y_max_cap=100.0,
         chart_anchor=f"A{n_rows + 3}",
+        interval_sec=interval_sec,
     )
 
     freq_df = chart_gpu_df[[chart_gpu_df.columns[0], "纵坐标_gpufreq(MHz)"]]
     _add_scatter_line_chart(
         ws,
         freq_df,
-        chart_title="GPU Frequency (5s avg, measure gpufreq)",
+        chart_title=f"GPU Frequency ({il} avg, measure gpufreq)",
         colors=(GPU_LINE_COLORS[1],),
         show_data_labels=True,
         y_axis_title="GPU Frequency (MHz)",
         y_max_cap=None,
         chart_anchor=f"M{n_rows + 3}",
+        interval_sec=interval_sec,
     )
 
     wb.save(xlsx_path)
 
 
-def _add_cpu_gpu_merged_chart(xlsx_path: Path, chart_cpu_gpu_df: pd.DataFrame) -> None:
+def _add_cpu_gpu_merged_chart(xlsx_path: Path, chart_cpu_gpu_df: pd.DataFrame, interval_sec: float) -> None:
     if chart_cpu_gpu_df.empty:
         return
 
+    il = format_interval_label(interval_sec)
     wb = load_workbook(xlsx_path)
     if "chart_cpu_gpu" not in wb.sheetnames:
         wb.save(xlsx_path)
@@ -670,11 +781,12 @@ def _add_cpu_gpu_merged_chart(xlsx_path: Path, chart_cpu_gpu_df: pd.DataFrame) -
     _add_scatter_line_chart(
         wb["chart_cpu_gpu"],
         chart_cpu_gpu_df,
-        chart_title="CPU Group & GPU Load (5s, %)",
+        chart_title=f"CPU Group & GPU Load ({il}, %)",
         colors=CPU_GPU_MERGE_COLORS,
         show_data_labels=True,
         y_axis_title="Load (%)",
         y_max_cap=100.0,
+        interval_sec=interval_sec,
     )
     wb.save(xlsx_path)
 
@@ -696,11 +808,13 @@ def export_xlsx(
     output_path: Path,
     *,
     source_label: str,
+    interval_sec: float,
     gpu_df: pd.DataFrame | None = None,
 ) -> None:
+    il = format_interval_label(interval_sec)
     merged_duration = 0.0
     if not cpu_df.empty and "elapsed_sec" in cpu_df.columns:
-        merged_duration = float(cpu_df["elapsed_sec"].max()) + CPU_GROUP_INTERVAL_SEC
+        merged_duration = float(cpu_df["elapsed_sec"].max()) + interval_sec
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary = pd.DataFrame(
@@ -709,14 +823,15 @@ def export_xlsx(
                     "source": source_label,
                     "db_file_count": len(file_meta.get("files", [])),
                     "trace_duration_sec": round(merged_duration, 3),
-                    "cpu_usage_5s_rows": len(cpu_df),
-                    "gpu_measure_5s_rows": 0 if gpu_df is None else len(gpu_df),
+                    f"cpu_usage_{il}_rows": len(cpu_df),
+                    f"gpu_measure_{il}_rows": 0 if gpu_df is None else len(gpu_df),
+                    "interval_sec": interval_sec,
                     "cpu_usage_note": (
-                        "5s 窗口；HiSmartPerf thread_state Running + trace_range 口径；"
+                        f"{il} 窗口；HiSmartPerf thread_state Running + trace_range 口径；"
                         "多文件按文件名时间戳墙钟拼接"
                     ),
                     "gpu_measure_note": (
-                        "5s 窗口；measure 表 gpuload/gpufreq 时间加权平均；"
+                        f"{il} 窗口；measure 表 gpuload/gpufreq 时间加权平均；"
                         "gpufreq 取各 clock 域窗口均值的最大值(MHz)"
                     ),
                     "chart_xy_note": (
@@ -735,16 +850,18 @@ def export_xlsx(
         chart_xy_df = pd.DataFrame()
         chart_xy_group_df = pd.DataFrame()
         sorted_cpu_df = pd.DataFrame()
+        cpu_sheet_name = f"cpu_usage_{il}"
+        gpu_sheet_name = f"gpu_measure_{il}"
         if cpu_df.empty:
             pd.DataFrame({"info": ["未找到 Running 状态 CPU 数据"]}).to_excel(
-                writer, sheet_name="cpu_usage_5s", index=False
+                writer, sheet_name=cpu_sheet_name, index=False
             )
         else:
             sort_cols = [c for c in ("window_time_local", "window_start_ns", "elapsed_sec") if c in cpu_df.columns]
             sorted_cpu_df = cpu_df.sort_values(sort_cols)
             chart_xy_df = build_chart_xy_dataframe(sorted_cpu_df)
             chart_xy_group_df = build_chart_xy_group_dataframe(sorted_cpu_df)
-            format_datetime_columns(sorted_cpu_df).to_excel(writer, sheet_name="cpu_usage_5s", index=False)
+            format_datetime_columns(sorted_cpu_df).to_excel(writer, sheet_name=cpu_sheet_name, index=False)
 
         if not chart_xy_df.empty:
             chart_xy_df.to_excel(writer, sheet_name="chart_xy", index=False)
@@ -756,13 +873,13 @@ def export_xlsx(
         gpu_sorted = pd.DataFrame()
         if gpu_df is not None and not gpu_df.empty:
             gpu_sorted = gpu_df.sort_values("elapsed_sec")
-            gpu_sorted.to_excel(writer, sheet_name="gpu_measure_5s", index=False)
+            gpu_sorted.to_excel(writer, sheet_name=gpu_sheet_name, index=False)
             chart_gpu_df = build_chart_gpu_dataframe(gpu_sorted)
             if not chart_gpu_df.empty:
                 chart_gpu_df.to_excel(writer, sheet_name="chart_gpu", index=False)
         elif gpu_df is not None:
             pd.DataFrame({"info": ["未找到 gpuload/gpufreq measure 数据"]}).to_excel(
-                writer, sheet_name="gpu_measure_5s", index=False
+                writer, sheet_name=gpu_sheet_name, index=False
             )
 
         chart_cpu_gpu_df = build_chart_cpu_gpu_dataframe(
@@ -772,9 +889,9 @@ def export_xlsx(
         if not chart_cpu_gpu_df.empty:
             chart_cpu_gpu_df.to_excel(writer, sheet_name="chart_cpu_gpu", index=False)
 
-    _add_cpu_charts(output_path, chart_xy_df, chart_xy_group_df)
-    _add_gpu_charts(output_path, chart_gpu_df)
-    _add_cpu_gpu_merged_chart(output_path, chart_cpu_gpu_df)
+    _add_cpu_charts(output_path, chart_xy_df, chart_xy_group_df, interval_sec)
+    _add_gpu_charts(output_path, chart_gpu_df, interval_sec)
+    _add_cpu_gpu_merged_chart(output_path, chart_cpu_gpu_df, interval_sec)
 
 
 def _merge_file_meta(cpu_meta: dict, gpu_meta: dict) -> dict:
@@ -788,39 +905,108 @@ def _merge_file_meta(cpu_meta: dict, gpu_meta: dict) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print("Usage: python parse_hitrace_stats.py <trace.db|trace_dir> [output.xlsx]")
+    parser = argparse.ArgumentParser(
+        description="解析 HiSmartPerf .db trace 文件，按指定间隔导出 CPU/GPU 统计到 xlsx",
+    )
+    parser.add_argument(
+        "--db_file",
+        type=Path,
+        required=True,
+        help="待分析的 .db 文件路径",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=10.0,
+        help="统计窗口间隔，单位 ms（默认 10ms）",
+    )
+    parser.add_argument(
+        "--start_ns",
+        type=int,
+        default=None,
+        help="分析起始时间（trace 内部时间戳，ns），需在 trace_range 范围内",
+    )
+    parser.add_argument(
+        "--end_ns",
+        type=int,
+        default=None,
+        help="分析结束时间（trace 内部时间戳，ns），需在 trace_range 范围内",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="输出 xlsx 文件路径（默认与 db 同目录，后缀 .stats.xlsx）",
+    )
+    args = parser.parse_args(argv[1:])
+
+    db_path = args.db_file.resolve()
+    if not db_path.exists():
+        print(f"DB 文件不存在: {db_path}")
+        return 1
+    if db_path.suffix.lower() != ".db":
+        print(f"仅支持 .db 文件: {db_path}")
         return 1
 
-    input_path = Path(argv[1]).resolve()
-    if not input_path.exists():
-        print(f"Path not found: {input_path}")
+    interval_sec = args.interval / 1000.0  # ms → s
+
+    # 获取 trace_range 用于校验和坐标转换
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT start_ts, end_ts FROM trace_range").fetchone()
+    conn.close()
+    if not row:
+        print("trace_range 表无数据，无法获取时间范围")
+        return 1
+    trace_start_ts, trace_end_ts = int(row[0]), int(row[1])
+    print(f"trace_range: start_ts={trace_start_ts}, end_ts={trace_end_ts}")
+
+    # 校验用户指定的 start_ns / end_ns
+    start_ns = args.start_ns
+    end_ns = args.end_ns
+    if start_ns is not None and start_ns < trace_start_ts:
+        print(f"start_ns ({start_ns}) < trace_range.start_ts ({trace_start_ts})，超出范围")
+        return 1
+    if end_ns is not None and end_ns > trace_end_ts:
+        print(f"end_ns ({end_ns}) > trace_range.end_ts ({trace_end_ts})，超出范围")
+        return 1
+    if start_ns is not None and end_ns is not None and start_ns >= end_ns:
+        print(f"start_ns ({start_ns}) >= end_ns ({end_ns})，区间无效")
         return 1
 
-    if len(argv) > 2:
-        output_path = Path(argv[2]).resolve()
-    elif input_path.is_dir():
-        output_path = input_path / f"{input_path.name}.stats.xlsx"
-    else:
-        output_path = input_path.with_suffix(".stats.xlsx")
+    # 将 start_ns/end_ns 转换为 wall clock 时间戳（与 intervals/samples 的 wall_ts_ns 对齐）
+    wall_base_ns = filename_wall_base_ns(db_path)
+    range_start_wall_ns = wall_base_ns + (start_ns - trace_start_ts) if start_ns is not None else None
+    range_end_wall_ns = wall_base_ns + (end_ns - trace_start_ts) if end_ns is not None else None
+    if range_start_wall_ns is not None:
+        print(f"分析区间 wall_start: {range_start_wall_ns}")
+    if range_end_wall_ns is not None:
+        print(f"分析区间 wall_end: {range_end_wall_ns}")
 
-    print(f"Reading {input_path} ...")
-    db_files = parse_db_inputs(input_path)
+    # 输出路径
+    output_path = args.output.resolve() if args.output else db_path.with_suffix(".stats.xlsx")
+
+    print(f"Reading {db_path} ...")
+    db_files = [db_path]
     intervals, cpu_meta = merge_db_intervals(db_files)
     gpu_samples, gpu_meta = merge_gpu_samples(db_files)
     file_meta = _merge_file_meta(cpu_meta, gpu_meta)
-    cpu_df = compute_cpu_usage_5s(intervals)
-    gpu_df = compute_gpu_measure_5s(gpu_samples)
+    cpu_df = compute_cpu_usage(intervals, interval_sec, range_start_wall_ns, range_end_wall_ns)
+    gpu_df = compute_gpu_measure(gpu_samples, interval_sec, range_start_wall_ns, range_end_wall_ns)
 
-    source_label = db_files[0].name if len(db_files) == 1 else f"{len(db_files)} files (time-merged)"
-    export_xlsx(cpu_df, file_meta, output_path, source_label=source_label, gpu_df=gpu_df)
+    source_label = db_path.name
+    il = format_interval_label(interval_sec)
+    export_xlsx(
+        cpu_df, file_meta, output_path,
+        source_label=source_label, interval_sec=interval_sec, gpu_df=gpu_df,
+    )
 
-    print(f"Done. Output: {output_path}")
-    print(f"  db files: {len(db_files)}")
+    print(f"Done.")
+    print(f"Output: {output_path}")
+    print(f"  interval: {il}")
     print(f"  running slices: {len(intervals)}")
-    print(f"  cpu_usage_5s rows: {len(cpu_df)}")
+    print(f"  cpu_usage rows: {len(cpu_df)}")
     print(f"  gpu measure samples: {len(gpu_samples)}")
-    print(f"  gpu_measure_5s rows: {len(gpu_df)}")
+    print(f"  gpu_measure rows: {len(gpu_df)}")
     return 0
 
 
