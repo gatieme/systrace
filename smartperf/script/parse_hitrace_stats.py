@@ -387,17 +387,17 @@ def build_chart_cpu_gpu_dataframe(
     if not has_cpu and not has_gpu:
         return pd.DataFrame()
 
-    elapsed_values: set[int] = set()
+    elapsed_values: set[float] = set()
     if has_cpu:
-        elapsed_values.update(int(v) for v in cpu_df["elapsed_sec"].tolist())
+        elapsed_values.update(round(v, 6) for v in cpu_df["elapsed_sec"].tolist())
     if has_gpu:
-        elapsed_values.update(int(v) for v in gpu_df["elapsed_sec"].tolist())
+        elapsed_values.update(round(v, 6) for v in gpu_df["elapsed_sec"].tolist())
 
     rows: list[dict[str, float | int]] = []
     for elapsed in sorted(elapsed_values):
         row_data: dict[str, float | int] = {"横坐标_相对时间(秒)": elapsed}
         if has_cpu:
-            cpu_rows = cpu_df[cpu_df["elapsed_sec"] == elapsed]
+            cpu_rows = cpu_df[cpu_df["elapsed_sec"].round(6) == elapsed]
             for group_name, cpu_range in CPU_GROUP_RANGES:
                 if cpu_rows.empty:
                     avg = 0.0
@@ -413,7 +413,7 @@ def build_chart_cpu_gpu_dataframe(
                     )
                 row_data[f"纵坐标_{group_name}"] = avg
         if has_gpu:
-            gpu_rows = gpu_df[gpu_df["elapsed_sec"] == elapsed]
+            gpu_rows = gpu_df[gpu_df["elapsed_sec"].round(6) == elapsed]
             row_data["纵坐标_gpuload(%)"] = (
                 float(gpu_rows.iloc[0]["gpuload"]) if not gpu_rows.empty else 0.0
             )
